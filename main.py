@@ -21,8 +21,14 @@ SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 # Counting settings (tweak these for your microscopy images)
 COUNTING_METHOD = "watershed"  # "threshold" | "watershed"
 THRESHOLD_METHOD = "adaptive"   # "otsu" | "adaptive" | "simple"
-MIN_CELL_AREA = 300          # pixels^2 -- blobs smaller than this are ignored
-MAX_CELL_AREA = 3_000       # pixels^2 -- blobs larger than this are ignored
+MIN_CELL_AREA = 200          # pixels^2 -- blobs smaller than this are ignored
+MAX_CELL_AREA = 4_000       # pixels^2 -- blobs larger than this are ignored
+
+# Watershed settings
+WATERSHED_FOREGROUND_THRESHOLD = 0.1
+WATERSHED_OPENING_KERNEL_SIZE = 1 # [1,3,7,9...]
+WATERSHED_OPENING_ITERATIONS = 1 # int
+WATERSHED_DEBUG = False
 
 # Summary settings
 PLOT_COUNTS = True         # set to True to save a cell-count-over-time plot
@@ -32,13 +38,18 @@ PLOT_COUNTS = True         # set to True to save a cell-count-over-time plot
 
 def build_output_dir() -> Path:
     """Return the annotated-image folder for the current run settings."""
-    return (
-        IMAGES_DIR
-        / (
-            f"annotated_{COUNTING_METHOD}_{THRESHOLD_METHOD}_"
-            f"min{MIN_CELL_AREA}_max{MAX_CELL_AREA}"
+    folder_name = f"annotated_{COUNTING_METHOD}_min{MIN_CELL_AREA}_max{MAX_CELL_AREA}"
+
+    if COUNTING_METHOD == "threshold":
+        folder_name += f"_{THRESHOLD_METHOD}"
+    elif COUNTING_METHOD == "watershed":
+        folder_name += (
+            f"_fg{WATERSHED_FOREGROUND_THRESHOLD:g}"
+            f"_openK{WATERSHED_OPENING_KERNEL_SIZE}"
+            f"_openI{WATERSHED_OPENING_ITERATIONS}"
         )
-    )
+
+    return IMAGES_DIR / folder_name
 
 
 def create_counter(image_path: Path) -> ThresholdCellCounter | WatershedCellCounter:
@@ -56,6 +67,10 @@ def create_counter(image_path: Path) -> ThresholdCellCounter | WatershedCellCoun
             image_path=str(image_path),
             min_cell_area=MIN_CELL_AREA,
             max_cell_area=MAX_CELL_AREA,
+            foreground_threshold=WATERSHED_FOREGROUND_THRESHOLD,
+            opening_kernel_size=WATERSHED_OPENING_KERNEL_SIZE,
+            opening_iterations=WATERSHED_OPENING_ITERATIONS,
+            debug=WATERSHED_DEBUG,
         )
 
     raise ValueError(
