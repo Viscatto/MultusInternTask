@@ -9,6 +9,7 @@ Annotated copies are saved to a settings-specific folder under `images/`.
 import sys
 from pathlib import Path
 
+from log_blob_cell_counter import LoGBlobCellCounter
 from summary_report import SummaryReport
 from threshold_cell_counter import ThresholdCellCounter
 from watershed_cell_counter import WatershedCellCounter
@@ -19,16 +20,26 @@ IMAGES_DIR = Path("images")                  # folder that contains the source i
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 # Counting settings (tweak these for your microscopy images)
-COUNTING_METHOD = "watershed"  # "threshold" | "watershed"
-THRESHOLD_METHOD = "adaptive"   # "otsu" | "adaptive" | "simple"
+COUNTING_METHOD = "log"  # "threshold" | "watershed" | "log"
 MIN_CELL_AREA = 200          # pixels^2 -- blobs smaller than this are ignored
 MAX_CELL_AREA = 4_000       # pixels^2 -- blobs larger than this are ignored
+
+# Thresholding settings
+THRESHOLD_METHOD = "adaptive"   # "otsu" | "adaptive" | "simple"
 
 # Watershed settings
 WATERSHED_FOREGROUND_THRESHOLD = 0.1
 WATERSHED_OPENING_KERNEL_SIZE = 1 # [1,3,7,9...]
 WATERSHED_OPENING_ITERATIONS = 1 # int
 WATERSHED_DEBUG = False
+
+# LoG blob detection settings
+LOG_MIN_SIGMA = 5.0
+LOG_MAX_SIGMA = 10.0
+LOG_NUM_SIGMA = 10
+LOG_RESPONSE_THRESHOLD = 0.06
+LOG_OVERLAP_THRESHOLD = 0.6
+LOG_DEBUG = False
 
 # Summary settings
 PLOT_COUNTS = True         # set to True to save a cell-count-over-time plot
@@ -48,11 +59,20 @@ def build_output_dir() -> Path:
             f"_openK{WATERSHED_OPENING_KERNEL_SIZE}"
             f"_openI{WATERSHED_OPENING_ITERATIONS}"
         )
+    elif COUNTING_METHOD == "log":
+        folder_name += (
+            f"_sigma{LOG_MIN_SIGMA:g}-{LOG_MAX_SIGMA:g}"
+            f"_n{LOG_NUM_SIGMA}"
+            f"_resp{LOG_RESPONSE_THRESHOLD:g}"
+            f"_overlap{LOG_OVERLAP_THRESHOLD:g}"
+        )
 
     return IMAGES_DIR / folder_name
 
 
-def create_counter(image_path: Path) -> ThresholdCellCounter | WatershedCellCounter:
+def create_counter(
+    image_path: Path,
+) -> ThresholdCellCounter | WatershedCellCounter | LoGBlobCellCounter:
     """Build the configured cell counter for one image."""
     if COUNTING_METHOD == "threshold":
         return ThresholdCellCounter(
@@ -73,9 +93,22 @@ def create_counter(image_path: Path) -> ThresholdCellCounter | WatershedCellCoun
             debug=WATERSHED_DEBUG,
         )
 
+    if COUNTING_METHOD == "log":
+        return LoGBlobCellCounter(
+            image_path=str(image_path),
+            min_cell_area=MIN_CELL_AREA,
+            max_cell_area=MAX_CELL_AREA,
+            min_sigma=LOG_MIN_SIGMA,
+            max_sigma=LOG_MAX_SIGMA,
+            num_sigma=LOG_NUM_SIGMA,
+            response_threshold=LOG_RESPONSE_THRESHOLD,
+            overlap_threshold=LOG_OVERLAP_THRESHOLD,
+            debug=LOG_DEBUG,
+        )
+
     raise ValueError(
         f"Unknown COUNTING_METHOD '{COUNTING_METHOD}'. "
-        "Choose 'threshold' or 'watershed'."
+        "Choose 'threshold', 'watershed', or 'log'."
     )
 
 
