@@ -9,10 +9,12 @@ Annotated copies are saved to a settings-specific folder under `images/`.
 import sys
 from pathlib import Path
 
+from cellpose_cell_counter import CellposeCellCounter
 from log_blob_cell_counter import LoGBlobCellCounter
 from summary_report import SummaryReport
 from threshold_cell_counter import ThresholdCellCounter
 from watershed_cell_counter import WatershedCellCounter
+
 
 # Configuration
 
@@ -20,7 +22,7 @@ IMAGES_DIR = Path("images")                  # folder that contains the source i
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 # Counting settings (tweak these for your microscopy images)
-COUNTING_METHOD = "log"  # "threshold" | "watershed" | "log"
+COUNTING_METHOD = "cellpose"  # "threshold" | "watershed" | "log" | "cellpose"
 MIN_CELL_AREA = 200          # pixels^2 -- blobs smaller than this are ignored
 MAX_CELL_AREA = 4_000       # pixels^2 -- blobs larger than this are ignored
 
@@ -40,6 +42,24 @@ LOG_NUM_SIGMA = 10
 LOG_RESPONSE_THRESHOLD = 0.06
 LOG_OVERLAP_THRESHOLD = 0.6
 LOG_DEBUG = False
+
+# Cellpose settings
+CELLPOSE_MODEL_TYPE = "nuclei"
+CELLPOSE_TRAIN_MODEL = True
+CELLPOSE_CUSTOM_MODELS_DIR = Path("cellpose_models")
+CELLPOSE_CUSTOM_MODEL_NAME = None
+CELLPOSE_PRETRAINED_MODEL_PATH = None
+CELLPOSE_DIAMETER = 100
+CELLPOSE_FLOW_THRESHOLD = 0.8
+CELLPOSE_CELLPROB_THRESHOLD = -4.0
+CELLPOSE_CHANNELS = [0, 0]
+CELLPOSE_USE_GPU = False
+CELLPOSE_NORMALIZE = True
+CELLPOSE_USE_PREPROCESSED_IMAGE = True
+CELLPOSE_MAX_IMAGE_DIMENSION = 512
+CELLPOSE_BATCH_SIZE = 1
+CELLPOSE_TILE_OVERLAP = 0.05
+CELLPOSE_BSIZE = 256
 
 # Summary settings
 PLOT_COUNTS = True         # set to True to save a cell-count-over-time plot
@@ -66,13 +86,31 @@ def build_output_dir() -> Path:
             f"_resp{LOG_RESPONSE_THRESHOLD:g}"
             f"_overlap{LOG_OVERLAP_THRESHOLD:g}"
         )
+    elif COUNTING_METHOD == "cellpose":
+        diameter = "auto" if CELLPOSE_DIAMETER is None else f"{CELLPOSE_DIAMETER:g}"
+        model_label = CELLPOSE_CUSTOM_MODEL_NAME or CELLPOSE_MODEL_TYPE
+        folder_name += (
+            f"_{model_label}"
+            f"_diam{diameter}"
+            f"_flow{CELLPOSE_FLOW_THRESHOLD:g}"
+            f"_prob{CELLPOSE_CELLPROB_THRESHOLD:g}"
+            f"_ch{CELLPOSE_CHANNELS[0]}-{CELLPOSE_CHANNELS[1]}"
+            f"_pre{int(CELLPOSE_USE_PREPROCESSED_IMAGE)}"
+            f"_maxdim{CELLPOSE_MAX_IMAGE_DIMENSION}"
+            f"_train{int(CELLPOSE_TRAIN_MODEL)}"
+        )
 
     return IMAGES_DIR / folder_name
 
 
 def create_counter(
     image_path: Path,
-) -> ThresholdCellCounter | WatershedCellCounter | LoGBlobCellCounter:
+) -> (
+    ThresholdCellCounter
+    | WatershedCellCounter
+    | LoGBlobCellCounter
+    | CellposeCellCounter
+):
     """Build the configured cell counter for one image."""
     if COUNTING_METHOD == "threshold":
         return ThresholdCellCounter(
@@ -106,9 +144,36 @@ def create_counter(
             debug=LOG_DEBUG,
         )
 
+    if COUNTING_METHOD == "cellpose":
+        return CellposeCellCounter(
+            image_path=str(image_path),
+            min_cell_area=MIN_CELL_AREA,
+            max_cell_area=MAX_CELL_AREA,
+            model_type=CELLPOSE_MODEL_TYPE,
+            train_model=CELLPOSE_TRAIN_MODEL,
+            custom_models_dir=str(CELLPOSE_CUSTOM_MODELS_DIR),
+            custom_model_name=CELLPOSE_CUSTOM_MODEL_NAME,
+            pretrained_model_path=(
+                str(CELLPOSE_PRETRAINED_MODEL_PATH)
+                if CELLPOSE_PRETRAINED_MODEL_PATH is not None
+                else None
+            ),
+            diameter=CELLPOSE_DIAMETER,
+            flow_threshold=CELLPOSE_FLOW_THRESHOLD,
+            cellprob_threshold=CELLPOSE_CELLPROB_THRESHOLD,
+            channels=CELLPOSE_CHANNELS,
+            use_gpu=CELLPOSE_USE_GPU,
+            normalize=CELLPOSE_NORMALIZE,
+            use_preprocessed_image=CELLPOSE_USE_PREPROCESSED_IMAGE,
+            max_image_dimension=CELLPOSE_MAX_IMAGE_DIMENSION,
+            batch_size=CELLPOSE_BATCH_SIZE,
+            tile_overlap=CELLPOSE_TILE_OVERLAP,
+            bsize=CELLPOSE_BSIZE,
+        )
+
     raise ValueError(
         f"Unknown COUNTING_METHOD '{COUNTING_METHOD}'. "
-        "Choose 'threshold', 'watershed', or 'log'."
+        "Choose 'threshold', 'watershed', 'log', or 'cellpose'."
     )
 
 
@@ -150,6 +215,26 @@ def process_image(image_path: Path, output_dir: Path) -> dict:
 # Entry point
 
 def main() -> None:
+    if COUNTING_METHOD == "cellpose" and CELLPOSE_TRAIN_MODEL:
+        counter = create_counter(IMAGES_DIR / "training_placeholder.tif")
+        try:
+            counter.run()
+        except RuntimeError as exc:
+            print(exc)
+            saved_model_path = counter.resolve_saved_model_path()
+            if saved_model_path is not None:
+                print(
+                    "After training in the Cellpose GUI, save the model here: "
+                    f"{saved_model_path.resolve()}"
+                )
+            else:
+                print(
+                    "After training in the Cellpose GUI, set "
+                    "CELLPOSE_CUSTOM_MODEL_NAME to the saved model name so it "
+                    "can be reused in future experiments."
+                )
+        return
+
     output_dir = build_output_dir()
     if output_dir.exists():
         print(
