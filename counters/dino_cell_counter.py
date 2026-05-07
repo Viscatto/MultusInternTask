@@ -2,6 +2,9 @@ import math
 
 import cv2
 import numpy as np
+from skimage.feature import peak_local_max
+from skimage.filters import frangi
+from sklearn.decomposition import PCA
 
 from base_cell_counter import BaseCellCounter
 
@@ -62,17 +65,7 @@ class DinoCellCounter(BaseCellCounter):
         """Return last-layer patch tokens for the given image."""
         tensor, _, patch_grid = self._prepare_dino_input(image)
         with self._torch.no_grad():
-            features = self.model.forward_features(tensor)
-
-        if isinstance(features, dict):
-            patch_tokens = features.get("x_norm_patchtokens")
-            if patch_tokens is None:
-                patch_tokens = features.get("x_prenorm")[:, 1:, :]
-        else:
-            patch_tokens = features[:, 1:, :]
-
-        if patch_tokens is None:
-            raise RuntimeError("Could not extract DINO patch tokens from the model.")
+            patch_tokens = self._forward_patch_tokens(tensor, patch_grid)
 
         patch_tokens = patch_tokens[0].detach().cpu().numpy()
         return patch_tokens.reshape(patch_grid[0], patch_grid[1], -1)
@@ -82,10 +75,7 @@ class DinoCellCounter(BaseCellCounter):
         tensor, prepared_shape, patch_grid = self._prepare_dino_input(image)
 
         with self._torch.no_grad():
-            x = self.model.patch_embed(tensor)
-            x = self._embed_tokens(x, patch_grid)
-            for block in self.model.blocks[:-1]:
-                x = block(x)
+            x = self._forward_token_sequence(tensor, patch_grid, stop_before_last=True)
 
             last_block = self.model.blocks[-1]
             x_norm = last_block.norm1(x)
@@ -124,20 +114,38 @@ class DinoCellCounter(BaseCellCounter):
         """
         Count cells and return `(count, coordinates)` in original image space.
         """
-        attention_map = self.extract_attention(image)
-        binary = self._threshold_attention(attention_map)
-        cleaned = self._cleanup_mask(binary)
-        filtered = self._filter_components(cleaned)
-        distance = cv2.distanceTransform(filtered, cv2.DIST_L2, 5)
-        coordinates = self._detect_peaks(distance, filtered)
+        all_coordinates: list[tuple[int, int]] = []
+        debug_payload = None
 
-        self.debug_images = {
-            "attention": np.uint8(attention_map * 255),
-            "binary": binary,
-            "cleaned": cleaned,
-            "filtered": filtered,
-            "distance": self._normalize_to_uint8(distance),
-        }
+        for scale in (0.75, 1.0, 1.25):
+            scaled_image = self._resize_by_scale(image, scale)
+            feature_map = self._compute_feature_map(scaled_image)
+            ridge_map = self._compute_ridge_map(scaled_image)
+            combined_map = self._combine_detection_maps(feature_map, ridge_map)
+
+            threshold = np.percentile(combined_map, 75)
+            binary_mask = np.uint8(combined_map >= threshold) * 255
+            binary_mask = self._cleanup_mask(binary_mask)
+            binary_mask = self._filter_components(binary_mask)
+
+            distance = cv2.distanceTransform(binary_mask, cv2.DIST_L2, 5)
+            coordinates = self._detect_peaks(distance, binary_mask)
+            all_coordinates.extend(
+                self._rescale_coordinates_to_original(coordinates, scale)
+            )
+
+            if debug_payload is None or abs(scale - 1.0) < 1e-6:
+                debug_payload = {
+                    "feature_map": self._normalize_to_uint8(feature_map),
+                    "ridge_map": self._normalize_to_uint8(ridge_map),
+                    "combined_map": self._normalize_to_uint8(combined_map),
+                    "binary_mask": binary_mask,
+                    "distance_map": self._normalize_to_uint8(distance),
+                }
+
+        coordinates = self._suppress_coordinate_overlaps(all_coordinates)
+
+        self.debug_images = debug_payload or {}
         if self.debug:
             self.show_debug_images()
 
@@ -373,6 +381,37 @@ class DinoCellCounter(BaseCellCounter):
         binary[attention_map >= self.attention_threshold] = 255
         return binary
 
+    def _compute_feature_map(self, image: np.ndarray) -> np.ndarray:
+        """Project DINO patch features to a saliency map with PCA."""
+        features = self.extract_features(image)
+        patch_height, patch_width, channels = features.shape
+        flat_features = features.reshape(-1, channels)
+
+        component_count = max(1, min(3, flat_features.shape[0], flat_features.shape[1]))
+        reduced = PCA(n_components=component_count).fit_transform(flat_features)
+        reduced = reduced.reshape(patch_height, patch_width, component_count)
+
+        l2_map = np.linalg.norm(reduced, axis=-1)
+        variance_map = np.var(reduced, axis=-1)
+        feature_map = 0.5 * self._normalize_map(l2_map) + 0.5 * self._normalize_map(variance_map)
+
+        return self._resize_to_original_space(feature_map, image.shape[:2])
+
+    def _compute_ridge_map(self, image: np.ndarray) -> np.ndarray:
+        """Enhance elongated cell-like structures with Frangi filtering."""
+        gray = self._preprocess_grayscale(image)
+        ridge = frangi(gray.astype(np.float32) / 255.0)
+        return self._normalize_map(ridge)
+
+    def _combine_detection_maps(
+        self,
+        feature_map: np.ndarray,
+        ridge_map: np.ndarray,
+    ) -> np.ndarray:
+        """Blend feature and ridge evidence into the final detection map."""
+        combined = 0.6 * self._normalize_map(feature_map) + 0.4 * self._normalize_map(ridge_map)
+        return self._normalize_map(combined)
+
     def _cleanup_mask(self, binary: np.ndarray) -> np.ndarray:
         """Apply configurable opening and closing to the thresholded mask."""
         cleaned = binary.copy()
@@ -421,40 +460,70 @@ class DinoCellCounter(BaseCellCounter):
         distance: np.ndarray,
         mask: np.ndarray,
     ) -> list[tuple[int, int]]:
-        """Find local maxima and suppress peaks that are too close together."""
-        distance_max = distance.max()
-        if distance_max <= 0:
+        """Find local maxima on the distance transform."""
+        if distance.max() <= 0:
             return []
 
-        normalized = distance / distance_max
-        dilation_size = max(3, self.min_cell_distance * 2 + 1)
-        local_max = cv2.dilate(
-            normalized,
-            np.ones((dilation_size, dilation_size), dtype=np.uint8),
+        peak_coordinates = peak_local_max(
+            distance,
+            min_distance=self.min_cell_distance,
+            threshold_abs=self.peak_threshold,
+            labels=(mask > 0),
         )
-        candidates_mask = (
-            (normalized == local_max)
-            & (normalized >= self.peak_threshold)
-            & (mask > 0)
-        )
-        ys, xs = np.where(candidates_mask)
+        return [(int(x), int(y)) for y, x in peak_coordinates]
 
-        candidates = sorted(
-            (
-                (int(x), int(y), float(normalized[y, x]))
-                for x, y in zip(xs, ys)
-            ),
-            key=lambda item: item[2],
-            reverse=True,
-        )
-
+    def _suppress_coordinate_overlaps(
+        self,
+        coordinates: list[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        """Merge multi-scale detections with a final distance-based NMS."""
         kept: list[tuple[int, int]] = []
         min_distance_sq = self.min_cell_distance ** 2
-        for x, y, _ in candidates:
-            if all((x - kx) ** 2 + (y - ky) ** 2 >= min_distance_sq for kx, ky in kept):
-                kept.append((x, y))
+
+        for x, y in coordinates:
+            if 0 <= x and 0 <= y:
+                if all((x - kx) ** 2 + (y - ky) ** 2 >= min_distance_sq for kx, ky in kept):
+                    kept.append((x, y))
 
         return kept
+
+    def _forward_patch_tokens(self, tensor, patch_grid: tuple[int, int]):
+        """Return final patch tokens across DINO/timm model variants."""
+        if hasattr(self.model, "forward_features"):
+            features = self.model.forward_features(tensor)
+            if isinstance(features, dict):
+                patch_tokens = features.get("x_norm_patchtokens")
+                if patch_tokens is None:
+                    prenorm = features.get("x_prenorm")
+                    if prenorm is not None:
+                        patch_tokens = prenorm[:, 1:, :]
+            else:
+                patch_tokens = features[:, 1:, :]
+
+            if patch_tokens is not None:
+                return patch_tokens
+
+        x = self._forward_token_sequence(tensor, patch_grid, stop_before_last=False)
+        return x[:, 1:, :]
+
+    def _forward_token_sequence(
+        self,
+        tensor,
+        patch_grid: tuple[int, int],
+        stop_before_last: bool,
+    ):
+        """Run the transformer token path with broad model-version compatibility."""
+        x = self.model.patch_embed(tensor)
+        x = self._embed_tokens(x, patch_grid)
+
+        blocks = self.model.blocks[:-1] if stop_before_last else self.model.blocks
+        for block in blocks:
+            x = block(x)
+
+        norm = getattr(self.model, "norm", None)
+        if norm is not None and not stop_before_last:
+            x = norm(x)
+        return x
 
     def _point_contour(self, x: int, y: int) -> np.ndarray:
         """Create a small circle contour around a detected center."""
@@ -479,6 +548,15 @@ class DinoCellCounter(BaseCellCounter):
             return np.zeros_like(image, dtype=np.uint8)
         return np.uint8(np.clip((image / max_value) * 255.0, 0, 255))
 
+    def _normalize_map(self, image: np.ndarray) -> np.ndarray:
+        """Normalize a float map to [0, 1]."""
+        image = image.astype(np.float32)
+        min_value = image.min()
+        max_value = image.max()
+        if max_value <= min_value:
+            return np.zeros_like(image, dtype=np.float32)
+        return (image - min_value) / (max_value - min_value)
+
     def _patch_size(self) -> int:
         """Return the ViT patch size."""
         return 16
@@ -501,3 +579,38 @@ class DinoCellCounter(BaseCellCounter):
                 "available."
             ) from exc
         return torch
+
+    def _preprocess_grayscale(self, image: np.ndarray) -> np.ndarray:
+        """Apply the same grayscale preprocessing path to arbitrary image scales."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+
+    def _resize_by_scale(self, image: np.ndarray, scale: float) -> np.ndarray:
+        """Resize an image for multi-scale detection."""
+        if abs(scale - 1.0) < 1e-6:
+            return image.copy()
+
+        height, width = image.shape[:2]
+        resized_width = max(16, int(round(width * scale)))
+        resized_height = max(16, int(round(height * scale)))
+        return cv2.resize(
+            image,
+            (resized_width, resized_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    def _rescale_coordinates_to_original(
+        self,
+        coordinates: list[tuple[int, int]],
+        scale: float,
+    ) -> list[tuple[int, int]]:
+        """Map multi-scale detections back to original image coordinates."""
+        if abs(scale - 1.0) < 1e-6:
+            return coordinates
+
+        return [
+            (int(round(x / scale)), int(round(y / scale)))
+            for x, y in coordinates
+        ]

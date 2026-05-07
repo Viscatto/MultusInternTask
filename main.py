@@ -9,31 +9,40 @@ Annotated copies are saved to a settings-specific folder under `images/`.
 import sys
 from pathlib import Path
 
-from cellpose_cell_counter import CellposeCellCounter
-from dino_cell_counter import DinoCellCounter
-from log_blob_cell_counter import LoGBlobCellCounter
+from counters.cellpose_cell_counter import CellposeCellCounter
+from counters.dino_cell_counter import DinoCellCounter
+from counters.dino_cell_counter2 import DinoCellCounter2
+from counters.log_blob_cell_counter import LoGBlobCellCounter
+from preprocess_images import (
+    build_output_path as build_preprocess_output_path,
+)
+from preprocess_images import process_image as preprocess_only_image
+from preprocess_images import save_image as save_preprocess_image
 from summary_report import SummaryReport
-from threshold_cell_counter import ThresholdCellCounter
-from watershed_cell_counter import WatershedCellCounter
+from counters.threshold_cell_counter import ThresholdCellCounter
+from counters.watershed_cell_counter import WatershedCellCounter
 
 
 # Configuration
 
-IMAGES_DIR = Path("images")                  # folder that contains the source images
+IMAGES_DIR = Path("output")                  # folder that contains the source images
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 # Counting settings (tweak these for your microscopy images)
-COUNTING_METHOD = "dino"  # "threshold" | "watershed" | "log" | "cellpose" | "dino"
-MIN_CELL_AREA = 200          # pixels^2 -- blobs smaller than this are ignored
-MAX_CELL_AREA = 4_000       # pixels^2 -- blobs larger than this are ignored
+COUNTING_METHOD = "watershed"  # "threshold" | "watershed" | "log" | "cellpose" | "dino" | "dino2" | "preprocess"
+MIN_CELL_AREA = 300          # pixels^2 -- blobs smaller than this are ignored
+MAX_CELL_AREA = 2_000       # pixels^2 -- blobs larger than this are ignored
+
+# Preprocessing-only settings
+PREPROCESS_OUTPUT_DIR = Path("output")
 
 # Thresholding settings
 THRESHOLD_METHOD = "adaptive"   # "otsu" | "adaptive" | "simple"
 
 # Watershed settings
 WATERSHED_FOREGROUND_THRESHOLD = 0.1
-WATERSHED_OPENING_KERNEL_SIZE = 1 # [1,3,7,9...]
-WATERSHED_OPENING_ITERATIONS = 1 # int
+WATERSHED_OPENING_KERNEL_SIZE = 3 # [1,3,5,7,9...]
+WATERSHED_OPENING_ITERATIONS = 2 # int
 WATERSHED_DEBUG = False
 
 # LoG blob detection settings
@@ -45,7 +54,7 @@ LOG_OVERLAP_THRESHOLD = 0.6
 LOG_DEBUG = False
 
 # Cellpose settings
-CELLPOSE_MODEL_TYPE = "nuclei"
+CELLPOSE_MODEL_TYPE = "cyto3"
 CELLPOSE_TRAIN_MODEL = True
 CELLPOSE_CUSTOM_MODELS_DIR = Path("cellpose_models")
 CELLPOSE_CUSTOM_MODEL_NAME = None
@@ -65,7 +74,7 @@ CELLPOSE_BSIZE = 256
 # DINO attention settings
 DINO_MODEL_NAME = "vit_small_patch16_224.dino"
 DINO_THRESHOLD = 0.45
-MIN_CELL_DISTANCE = 18
+MIN_CELL_DISTANCE = 10
 MIN_CELL_SIZE = 40
 DINO_MAX_IMAGE_DIMENSION = 896
 DINO_OPENING_KERNEL_SIZE = 3
@@ -112,6 +121,20 @@ def build_output_dir() -> Path:
             f"_closeI{DINO_CLOSING_ITERATIONS}"
             f"_peak{DINO_PEAK_THRESHOLD:g}"
         )
+    elif COUNTING_METHOD == "dino2":
+        folder_name += (
+            f"_thr{DINO_THRESHOLD:g}"
+            f"_dist{MIN_CELL_DISTANCE}"
+            f"_size{MIN_CELL_SIZE}"
+            f"_maxdim{DINO_MAX_IMAGE_DIMENSION}"
+            f"_openK{DINO_OPENING_KERNEL_SIZE}"
+            f"_openI{DINO_OPENING_ITERATIONS}"
+            f"_closeK{DINO_CLOSING_KERNEL_SIZE}"
+            f"_closeI{DINO_CLOSING_ITERATIONS}"
+            f"_peak{DINO_PEAK_THRESHOLD:g}"
+        )
+    elif COUNTING_METHOD == "preprocess":
+        folder_name = PREPROCESS_OUTPUT_DIR.name
     elif COUNTING_METHOD == "cellpose":
         diameter = "auto" if CELLPOSE_DIAMETER is None else f"{CELLPOSE_DIAMETER:g}"
         model_label = CELLPOSE_CUSTOM_MODEL_NAME or CELLPOSE_MODEL_TYPE
@@ -136,6 +159,7 @@ def create_counter(
     | WatershedCellCounter
     | LoGBlobCellCounter
     | DinoCellCounter
+    | DinoCellCounter2
     | CellposeCellCounter
 ):
     """Build the configured cell counter for one image."""
@@ -189,6 +213,24 @@ def create_counter(
             model_name=DINO_MODEL_NAME,
         )
 
+    if COUNTING_METHOD == "dino2":
+        return DinoCellCounter2(
+            image_path=str(image_path),
+            min_cell_area=MIN_CELL_AREA,
+            max_cell_area=MAX_CELL_AREA,
+            attention_threshold=DINO_THRESHOLD,
+            min_cell_distance=MIN_CELL_DISTANCE,
+            min_cell_size=MIN_CELL_SIZE,
+            max_image_dimension=DINO_MAX_IMAGE_DIMENSION,
+            opening_kernel_size=DINO_OPENING_KERNEL_SIZE,
+            opening_iterations=DINO_OPENING_ITERATIONS,
+            closing_kernel_size=DINO_CLOSING_KERNEL_SIZE,
+            closing_iterations=DINO_CLOSING_ITERATIONS,
+            peak_threshold=DINO_PEAK_THRESHOLD,
+            debug=DINO_DEBUG,
+            model_name=DINO_MODEL_NAME,
+        )
+
     if COUNTING_METHOD == "cellpose":
         return CellposeCellCounter(
             image_path=str(image_path),
@@ -218,7 +260,7 @@ def create_counter(
 
     raise ValueError(
         f"Unknown COUNTING_METHOD '{COUNTING_METHOD}'. "
-        "Choose 'threshold', 'watershed', 'log', 'dino', or 'cellpose'."
+        "Choose 'threshold', 'watershed', 'log', 'dino', 'dino2', or 'cellpose'."
     )
 
 
@@ -260,6 +302,24 @@ def process_image(image_path: Path, output_dir: Path) -> dict:
 # Entry point
 
 def main() -> None:
+    if COUNTING_METHOD == "preprocess":
+        output_dir = IMAGES_DIR.parent / PREPROCESS_OUTPUT_DIR
+        image_paths = collect_images(IMAGES_DIR)
+        print(f"Found {len(image_paths)} image(s) in '{IMAGES_DIR}'. Preprocessing...\n")
+
+        for path in image_paths:
+            print(f"  Processing: {path.name} ...", end=" ", flush=True)
+            try:
+                preprocessed = preprocess_only_image(path)
+                output_path = build_preprocess_output_path(output_dir, path)
+                save_preprocess_image(preprocessed, output_path)
+                print(f"saved to {output_path.name}")
+            except Exception as exc:
+                print(f"FAILED ({exc})")
+
+        print(f"Processed masks saved to: {output_dir.resolve()}")
+        return
+
     if COUNTING_METHOD == "cellpose" and CELLPOSE_TRAIN_MODEL:
         counter = create_counter(IMAGES_DIR / "training_placeholder.tif")
         try:
