@@ -1,0 +1,16 @@
+# Core image processing
+numpy>=1.24
+opencv-python>=4.8
+scipy>=1.11
+scikit-image>=0.22
+
+# Plotting & reporting
+matplotlib>=3.8
+
+# Deep learning (DINO attention-based counter)
+torch>=2.1
+torchvision>=0.16
+timm>=0.9
+
+# Cell segmentation (Cellpose counter)
+cellpose>=3.0
